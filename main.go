@@ -116,7 +116,7 @@ func main() {
 		if node != nil {
 			node.AddOutputUniverse(uint16(m.OutputUniverse))
 		}
-		fmt.Printf("Art-Net merge: universe %d -> output universe %d (HTP)\n", m.SourceUniverse, m.OutputUniverse)
+		fmt.Printf(" | Art-Net merge: universe %d -> output universe %d (HTP)\n", m.SourceUniverse, m.OutputUniverse)
 	}
 
 	go merger.Run(ctx)
@@ -151,9 +151,9 @@ func main() {
 			select {
 			case ev := <-merger.Events:
 				if ev.Connected {
-					fmt.Printf("Art-Net merge: source %s connected\n", ev.ID)
+					fmt.Printf(" | Art-Net merge: source %s connected\n", ev.ID)
 				} else {
-					fmt.Printf("Art-Net merge: source %s disconnected (timeout)\n", ev.ID)
+					fmt.Printf(" | Art-Net merge: source %s disconnected (timeout)\n", ev.ID)
 				}
 			case <-ctx.Done():
 				return
