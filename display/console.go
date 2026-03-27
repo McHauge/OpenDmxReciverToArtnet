@@ -18,21 +18,26 @@ const (
 )
 
 type Console struct {
-	maxChannels int
-	frameCount  uint64
-	lastFPSTime time.Time
-	fps         float64
-	fpsFrames   uint64
+	maxChannels     int
+	quiet           bool
+	frameCount      uint64
+	lastFPSTime     time.Time
+	fps             float64
+	fpsFrames       uint64
+	lastReportedFPS float64
+	firstFrame      bool
 }
 
-func NewConsole(maxChannels int) *Console {
+func NewConsole(maxChannels int, quiet bool) *Console {
 	if maxChannels <= 0 || maxChannels > dmx.MaxChannels {
 		maxChannels = dmx.MaxChannels
 	}
 	enableANSI()
 	return &Console{
 		maxChannels: maxChannels,
+		quiet:       quiet,
 		lastFPSTime: time.Now(),
+		firstFrame:  true,
 	}
 }
 
@@ -91,6 +96,38 @@ func (c *Console) Render(frame dmx.Frame) {
 	sb.WriteString("\nPress Ctrl+C to exit\n")
 
 	os.Stdout.WriteString(sb.String())
+}
+
+func (c *Console) Quiet() bool {
+	return c.quiet
+}
+
+func (c *Console) RenderStatus(frame dmx.Frame) {
+	c.frameCount++
+	c.fpsFrames++
+
+	now := time.Now()
+	elapsed := now.Sub(c.lastFPSTime).Seconds()
+	if elapsed >= 1.0 {
+		c.fps = float64(c.fpsFrames) / elapsed
+		c.fpsFrames = 0
+		c.lastFPSTime = now
+	}
+
+	fpsDiff := c.fps - c.lastReportedFPS
+	if fpsDiff < 0 {
+		fpsDiff = -fpsDiff
+	}
+
+	if c.firstFrame || fpsDiff >= 1.0 {
+		c.firstFrame = false
+		c.lastReportedFPS = c.fps
+		fmt.Printf("\r\033[K\033[32mDMX Receiving\033[0m | %.1f fps | %d channels", c.fps, frame.Length)
+	}
+}
+
+func (c *Console) ShowNotReceiving() {
+	fmt.Printf("\r\033[K\033[33mDMX Not Receiving\033[0m | No data for 10s — check source/wiring")
 }
 
 func (c *Console) ShowWaiting() {

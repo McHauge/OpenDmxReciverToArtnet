@@ -13,6 +13,7 @@ type Config struct {
 	ComPort        string
 	Channels       int
 	NoBreakDetect  bool
+	Quiet          bool
 	ArtnetEnabled  bool
 	ArtnetDest     string
 	ArtnetUniverse int
@@ -76,6 +77,9 @@ func Apply(props map[string]string, cfg *Config) {
 	if v, ok := props["noBreakDetect"]; ok {
 		cfg.NoBreakDetect = v == "true"
 	}
+	if v, ok := props["quiet"]; ok {
+		cfg.Quiet = v == "true"
+	}
 	if v, ok := props["artnet"]; ok {
 		cfg.ArtnetEnabled = v == "true"
 	}
@@ -106,6 +110,9 @@ channels=512
 
 # Fallback mode: use read timeouts instead of BREAK detection (true/false)
 noBreakDetect=false
+
+# Quiet mode: show only receive status and FPS changes instead of full channel grid (true/false)
+quiet=false
 
 # Enable Art-Net output (true/false)
 artnet=false

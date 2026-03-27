@@ -36,6 +36,7 @@ func main() {
 
 	channels := flag.Int("channels", cfg.Channels, "number of DMX channels to display (1-512)")
 	noBreakDetect := flag.Bool("no-break-detect", cfg.NoBreakDetect, "fallback mode: use read timeouts instead of BREAK detection")
+	quiet := flag.Bool("quiet", cfg.Quiet, "show only receive status and FPS changes instead of full channel grid")
 	artnetEnabled := flag.Bool("artnet", cfg.ArtnetEnabled, "enable Art-Net output")
 	artnetDest := flag.String("artnet-dest", cfg.ArtnetDest, "Art-Net destination IP (broadcast or unicast)")
 	artnetUniverse := flag.Int("artnet-universe", cfg.ArtnetUniverse, "Art-Net universe number (0-32767)")
@@ -77,7 +78,7 @@ func main() {
 	defer stop()
 
 	receiver := dmx.NewReceiver(port, *noBreakDetect)
-	console := display.NewConsole(*channels)
+	console := display.NewConsole(*channels, *quiet)
 
 	var node *artnet.Node
 	if *artnetEnabled {
@@ -108,21 +109,29 @@ func main() {
 		select {
 		case frame := <-receiver.Frames:
 			noDataTimeout.Reset(10 * time.Second)
-			console.Render(frame)
+			if console.Quiet() {
+				console.RenderStatus(frame)
+			} else {
+				console.Render(frame)
+			}
 			if node != nil {
 				node.SendDmx(frame)
 			}
 
 		case <-noDataTimeout.C:
-			fmt.Println("\n\033[33mWarning: No DMX data received for 10 seconds.\033[0m")
-			fmt.Println("Possible causes:")
-			fmt.Println("  - No DMX source is transmitting on this universe")
-			fmt.Println("  - The adapter may not support receive mode")
-			fmt.Println("  - Check wiring and RS-485 termination")
-			if !*noBreakDetect {
-				fmt.Println("  - Try running with --no-break-detect flag")
+			if console.Quiet() {
+				console.ShowNotReceiving()
+			} else {
+				fmt.Println("\n\033[33mWarning: No DMX data received for 10 seconds.\033[0m")
+				fmt.Println("Possible causes:")
+				fmt.Println("  - No DMX source is transmitting on this universe")
+				fmt.Println("  - The adapter may not support receive mode")
+				fmt.Println("  - Check wiring and RS-485 termination")
+				if !*noBreakDetect {
+					fmt.Println("  - Try running with --no-break-detect flag")
+				}
+				fmt.Println("\nStill listening...")
 			}
-			fmt.Println("\nStill listening...")
 			noDataTimeout.Reset(30 * time.Second)
 
 		case <-ctx.Done():
