@@ -3,6 +3,7 @@ package artnet
 import (
 	"encoding/binary"
 	"net"
+	"time"
 
 	"github.com/mc-ha/OpenDmxReciver/dmx"
 )
@@ -142,6 +143,36 @@ func EncodeArtPollReply(localIP net.IP, universe uint16, shortName string) []byt
 	// MAC address (6 bytes at offset 201) — leave zeroed
 
 	return buf
+}
+
+// DecodeArtDmx parses an ArtDmx packet. Returns the frame, universe, and whether decoding succeeded.
+func DecodeArtDmx(data []byte) (dmx.Frame, uint16, bool) {
+	if len(data) < artDmxHeaderSize {
+		return dmx.Frame{}, 0, false
+	}
+	if string(data[0:8]) != Header {
+		return dmx.Frame{}, 0, false
+	}
+	opcode := binary.LittleEndian.Uint16(data[8:10])
+	if opcode != OpDmx {
+		return dmx.Frame{}, 0, false
+	}
+
+	universe := uint16(data[14]) | uint16(data[15])<<8
+	length := int(binary.BigEndian.Uint16(data[16:18]))
+	if length > dmx.MaxChannels {
+		length = dmx.MaxChannels
+	}
+	if len(data)-artDmxHeaderSize < length {
+		length = len(data) - artDmxHeaderSize
+	}
+
+	var frame dmx.Frame
+	copy(frame.Channels[:length], data[artDmxHeaderSize:artDmxHeaderSize+length])
+	frame.Length = length
+	frame.Timestamp = time.Now()
+
+	return frame, universe, true
 }
 
 // IsArtPoll checks if a received packet is an ArtPoll request.

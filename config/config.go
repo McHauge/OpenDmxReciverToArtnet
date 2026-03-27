@@ -9,6 +9,12 @@ import (
 	"strings"
 )
 
+// MergeMapping maps an Art-Net input universe to an output universe.
+type MergeMapping struct {
+	SourceUniverse int
+	OutputUniverse int
+}
+
 type Config struct {
 	ComPort        string
 	Channels       int
@@ -18,6 +24,8 @@ type Config struct {
 	ArtnetDest     string
 	ArtnetUniverse int
 	ArtnetBind     string
+	MergeInputs    []MergeMapping
+	MergeTimeout   int // seconds, 0 = persist forever
 }
 
 func Defaults() Config {
@@ -25,6 +33,7 @@ func Defaults() Config {
 		Channels:       512,
 		ArtnetDest:     "255.255.255.255",
 		ArtnetUniverse: 0,
+		MergeTimeout:   5,
 	}
 }
 
@@ -96,6 +105,41 @@ func Apply(props map[string]string, cfg *Config) {
 	if v, ok := props["artnetBind"]; ok {
 		cfg.ArtnetBind = v
 	}
+	if v, ok := props["mergeInputs"]; ok {
+		cfg.MergeInputs = ParseMergeInputs(v)
+	}
+	if v, ok := props["mergeTimeout"]; ok {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.MergeTimeout = n
+		} else {
+			fmt.Fprintf(os.Stderr, "Warning: invalid mergeTimeout value %q, using default\n", v)
+		}
+	}
+}
+
+// ParseMergeInputs parses a comma-separated list of "source:output" universe mappings.
+func ParseMergeInputs(s string) []MergeMapping {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
+	}
+	var mappings []MergeMapping
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		src, dst, ok := strings.Cut(part, ":")
+		if !ok {
+			fmt.Fprintf(os.Stderr, "Warning: invalid merge mapping %q (expected source:output), skipping\n", part)
+			continue
+		}
+		srcUni, err1 := strconv.Atoi(strings.TrimSpace(src))
+		dstUni, err2 := strconv.Atoi(strings.TrimSpace(dst))
+		if err1 != nil || err2 != nil {
+			fmt.Fprintf(os.Stderr, "Warning: invalid merge mapping %q, skipping\n", part)
+			continue
+		}
+		mappings = append(mappings, MergeMapping{SourceUniverse: srcUni, OutputUniverse: dstUni})
+	}
+	return mappings
 }
 
 const defaultTemplate = `# OpenDmxReciver Settings
@@ -125,6 +169,14 @@ artnetUniverse=0
 
 # Local IP to bind for Art-Net (leave empty for auto-detect)
 artnetBind=
+
+# Merge Art-Net inputs: sourceUniverse:outputUniverse (comma-separated)
+# Received Art-Net data is HTP-merged per output universe.
+# Example: mergeInputs=1:0,2:0  (merge universes 1 and 2 into output 0)
+mergeInputs=
+
+# Timeout in seconds for Art-Net merge sources (0 = persist forever)
+mergeTimeout=5
 `
 
 // GenerateDefault writes the default settings.properties template.

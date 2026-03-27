@@ -13,6 +13,7 @@ import (
 	"github.com/mc-ha/OpenDmxReciver/config"
 	"github.com/mc-ha/OpenDmxReciver/display"
 	"github.com/mc-ha/OpenDmxReciver/dmx"
+	"github.com/mc-ha/OpenDmxReciver/merge"
 )
 
 func main() {
@@ -41,6 +42,9 @@ func main() {
 	artnetDest := flag.String("artnet-dest", cfg.ArtnetDest, "Art-Net destination IP (broadcast or unicast)")
 	artnetUniverse := flag.Int("artnet-universe", cfg.ArtnetUniverse, "Art-Net universe number (0-32767)")
 	artnetBind := flag.String("artnet-bind", cfg.ArtnetBind, "local IP to bind for Art-Net (auto-detect if empty)")
+	mergeInputsStr := flag.String("merge-inputs", "", "Art-Net merge inputs as source:output pairs (e.g., 1:0,2:0)")
+	mergeTimeout := flag.Int("merge-timeout", cfg.MergeTimeout, "timeout in seconds for Art-Net merge sources (0 = persist forever)")
+	debugArtnet := flag.Bool("debug-artnet", false, "enable verbose Art-Net receive logging")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [flags] <COM port>\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Open DMX USB Receiver — reads DMX512 data and displays channel values.\n\n")
@@ -49,6 +53,12 @@ func main() {
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+
+	// CLI merge-inputs flag overrides config file
+	mergeInputs := cfg.MergeInputs
+	if *mergeInputsStr != "" {
+		mergeInputs = config.ParseMergeInputs(*mergeInputsStr)
+	}
 
 	portName := flag.Arg(0)
 	if portName == "" {
@@ -88,9 +98,28 @@ func main() {
 			os.Exit(1)
 		}
 		defer node.Close()
+		node.SetDebug(*debugArtnet)
 		go node.Run(ctx)
 		fmt.Printf("Art-Net output enabled: universe %d -> %s\n", *artnetUniverse, *artnetDest)
 	}
+
+	// Set up merger
+	merger := merge.NewMerger(time.Duration(*mergeTimeout) * time.Second)
+	merger.AddMapping("local", uint16(*artnetUniverse))
+
+	// Build set of allowed source universes for filtering
+	allowedSources := make(map[uint16]bool)
+	for _, m := range mergeInputs {
+		srcID := merge.SourceID(fmt.Sprintf("artnet:%d", m.SourceUniverse))
+		merger.AddMapping(srcID, uint16(m.OutputUniverse))
+		allowedSources[uint16(m.SourceUniverse)] = true
+		if node != nil {
+			node.AddOutputUniverse(uint16(m.OutputUniverse))
+		}
+		fmt.Printf("Art-Net merge: universe %d -> output universe %d (HTP)\n", m.SourceUniverse, m.OutputUniverse)
+	}
+
+	go merger.Run(ctx)
 
 	// Start receiver in background
 	go func() {
@@ -99,23 +128,75 @@ func main() {
 		}
 	}()
 
+	// Forward local DMX frames to merger and display
+	go func() {
+		for {
+			select {
+			case frame := <-receiver.Frames:
+				if console.Quiet() {
+					console.RenderStatus(frame)
+				} else {
+					console.Render(frame)
+				}
+				merger.Update("local", frame)
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	// Log merge source connect/disconnect events
+	go func() {
+		for {
+			select {
+			case ev := <-merger.Events:
+				if ev.Connected {
+					fmt.Printf("Art-Net merge: source %s connected\n", ev.ID)
+				} else {
+					fmt.Printf("Art-Net merge: source %s disconnected (timeout)\n", ev.ID)
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	// Forward received Art-Net frames to merger
+	if node != nil && len(mergeInputs) > 0 {
+		go func() {
+			for {
+				select {
+				case rf := <-node.ReceivedDmx:
+					if !allowedSources[rf.Universe] {
+						if *debugArtnet {
+							fmt.Printf("[artnet-debug] merge: universe %d not in allowed sources, skipping\n", rf.Universe)
+						}
+						continue
+					}
+					srcID := merge.SourceID(fmt.Sprintf("artnet:%d", rf.Universe))
+					if *debugArtnet {
+						fmt.Printf("[artnet-debug] merge: forwarding uni %d from %s as %s\n", rf.Universe, rf.Source, srcID)
+					}
+					merger.Update(srcID, rf.Frame)
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+
 	console.ShowWaiting()
 
-	// Display loop
+	// Main output loop
 	noDataTimeout := time.NewTimer(10 * time.Second)
 	defer noDataTimeout.Stop()
 
 	for {
 		select {
-		case frame := <-receiver.Frames:
+		case out := <-merger.Output:
 			noDataTimeout.Reset(10 * time.Second)
-			if console.Quiet() {
-				console.RenderStatus(frame)
-			} else {
-				console.Render(frame)
-			}
 			if node != nil {
-				node.SendDmx(frame)
+				node.SendDmxUniverse(out.Frame, out.Universe)
 			}
 
 		case <-noDataTimeout.C:
