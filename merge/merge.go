@@ -120,6 +120,11 @@ func (m *Merger) expireSources() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	// Zero timeout means sources never expire
+	if m.timeout <= 0 {
+		return
+	}
+
 	now := time.Now()
 	affected := make(map[uint16]bool)
 
