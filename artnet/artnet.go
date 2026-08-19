@@ -26,13 +26,7 @@ const (
 
 // EncodeArtDmx builds an ArtDmx packet from a DMX frame.
 func EncodeArtDmx(frame dmx.Frame, seq byte, universe uint16, physical byte) []byte {
-	length := frame.Length
-	if length < 2 {
-		length = 2
-	}
-	if length%2 != 0 {
-		length++
-	}
+	length := dmx.MaxChannels
 
 	buf := make([]byte, artDmxHeaderSize+length)
 
