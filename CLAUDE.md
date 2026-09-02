@@ -12,7 +12,7 @@ go build -o OpenDmxReciver.exe main.go
 
 CLI flags override values from `settings.properties`. Run with no args to use file-based config.
 
-No test suite exists yet. No CI/CD pipeline.
+`go test ./...` runs 52 tests covering `artnet/`, `config/` and `merge/` (currently 1 failing: `TestDecodeArtDmxRoundTrip` predates the fixed-512-channel `EncodeArtDmx` change). `dmx/` and `display/` are untested (thin wrappers over Windows syscalls). No CI/CD pipeline.
 
 ## Platform
 
@@ -22,13 +22,14 @@ No test suite exists yet. No CI/CD pipeline.
 
 Go module: `github.com/mc-ha/OpenDmxReciver` — single dependency: `golang.org/x/sys`.
 
-**Data flow:** USB serial (COM port) → DMX receiver → channel to main → display + Art-Net output.
+**Data flow:** USB serial (COM port) → DMX receiver → channel to main → display + merger → Art-Net output.
 
-Four packages:
+Five packages:
 
 - **`dmx/`** — Reads DMX512 frames from a serial adapter. Two modes: BREAK detection (default, uses overlapped I/O `WaitCommEvent`) and fallback mode (`-no-break-detect`, uses 2ms read timeout gaps). State machine: WaitBreak → WaitStartCode → ReadData. Serial config: 250000 baud, 8N2.
 - **`artnet/`** — Encodes/sends ArtDmx packets (OpCode 0x5000) over UDP port 6454. Responds to ArtPoll discovery. Falls back to ephemeral port if 6454 is unavailable.
 - **`config/`** — Parses Java-style `settings.properties` (key=value). Generates a template file if missing. CLI flags take precedence over file values.
+- **`merge/`** — HTP (highest takes precedence) merge of multiple sources per output universe. The local DMX input is source `local`; each `-merge-inputs source:output` pair adds source `artnet:<n>`. Sources silent for `-merge-timeout` seconds are zeroed and the universe recomputed.
 - **`display/`** — Renders a channel value grid (16 columns) with FPS counter to the Windows console. Quiet mode (`-quiet`) shows status line only.
 
 **Concurrency model:** `main.go` launches goroutines for the DMX receiver, display loop, and Art-Net listener. DMX frames flow through a buffered channel (cap 4). Shutdown is coordinated via `context.Context` cancellation.
