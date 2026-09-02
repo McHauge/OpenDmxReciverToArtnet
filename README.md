@@ -66,9 +66,9 @@ flowchart LR
     subgraph app [OpenDmxReciver]
         RX[dmx.Receiver<br/>BREAK state machine] -->|frames chan cap 4| MAIN(main loop)
         MAIN --> DISP[display.Console<br/>grid / quiet line]
-        MAIN -->|source &quot;local&quot;| MERGE[merge.Merger<br/>HTP per channel<br/>+ source timeout]
+        MAIN -->|as source local| MERGE[merge.Merger<br/>HTP per channel<br/>+ source timeout]
         MERGE -->|merged universe| OUT[artnet.Node<br/>ArtDmx out]
-        IN[artnet.Node<br/>ArtDmx in, UDP 6454] -->|source &quot;artnet:N&quot;| MERGE
+        IN[artnet.Node<br/>ArtDmx in, UDP 6454] -->|as source artnet N| MERGE
     end
 
     OUT -->|OpCode 0x5000| NET([Art-Net network])
