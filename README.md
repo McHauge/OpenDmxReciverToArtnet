@@ -60,21 +60,20 @@ OpenDmxReciver.exe -artnet -merge-inputs 1:0,2:0 COM3
 ## How it works
 
 ```mermaid
-flowchart LR
-    ADAPTER[USB DMX adapter<br/>COM port, 250k 8N2] --> RX
+flowchart TD
+    ADAPTER[USB DMX adapter<br/>250000 baud, 8N2] --> RX
+    RX[dmx.Receiver<br/>BREAK state machine] -->|frames chan, cap 4| MAIN(main loop)
 
-    subgraph app [OpenDmxReciver]
-        RX[dmx.Receiver<br/>BREAK state machine] -->|frames chan cap 4| MAIN(main loop)
-        MAIN --> DISP[display.Console<br/>grid / quiet line]
-        MAIN -->|as source local| MERGE[merge.Merger<br/>HTP per channel<br/>+ source timeout]
-        MERGE -->|merged universe| OUT[artnet.Node<br/>ArtDmx out]
-        IN[artnet.Node<br/>ArtDmx in, UDP 6454] -->|as source artnet N| MERGE
-    end
+    MAIN --> DISP[display.Console<br/>channel grid / quiet line]
+    MAIN -->|as source local| MERGE
 
-    OUT -->|OpCode 0x5000| NET([Art-Net network])
-    NET -->|other consoles / nodes| IN
-    NET -.->|ArtPoll| POLL[ArtPollReply]
-    POLL -.-> NET
+    NET([Art-Net network]) -->|ArtDmx in| IN[artnet.Node listener<br/>UDP 6454]
+    IN -->|as source artnet N| MERGE[merge.Merger<br/>HTP per channel<br/>+ source timeout]
+
+    MERGE -->|merged universe| OUT[artnet.Node sender<br/>ArtDmx, OpCode 0x5000]
+    OUT --> NET
+
+    IN -.->|ArtPoll| REPLY[ArtPollReply] -.-> NET
 ```
 
 The DMX receiver, the display loop and the Art-Net listener each run as goroutines; frames flow through a buffered channel (capacity 4, non-blocking send — frames are dropped rather than stalling the reader). Shutdown is coordinated with `context.Context` cancellation on Ctrl+C.
