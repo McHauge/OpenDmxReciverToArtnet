@@ -6,17 +6,26 @@ import (
 	"time"
 )
 
+// DefaultGapThreshold is the idle time after which fallback mode treats the
+// line as having gone quiet between frames. See runFallback for why this is
+// only a resync hint and not a primary framing mechanism.
+const DefaultGapThreshold = 2 * time.Millisecond
+
 type Receiver struct {
-	port          *SerialPort
+	port          Port
 	Frames        chan Frame
 	noBreakDetect bool
+
+	// GapThreshold tunes fallback mode only. Set it before calling Run.
+	GapThreshold time.Duration
 }
 
-func NewReceiver(port *SerialPort, noBreakDetect bool) *Receiver {
+func NewReceiver(port Port, noBreakDetect bool) *Receiver {
 	return &Receiver{
 		port:          port,
 		Frames:        make(chan Frame, 4),
 		noBreakDetect: noBreakDetect,
+		GapThreshold:  DefaultGapThreshold,
 	}
 }
 
@@ -27,26 +36,24 @@ func (r *Receiver) Run(ctx context.Context) error {
 	return r.runWithBreakDetect(ctx)
 }
 
+// emit publishes a completed frame, dropping it if the consumer is behind.
+// Dropping is correct here: DMX is a continuous state broadcast, so a stale
+// frame is worth less than the next fresh one.
+func (r *Receiver) emit(frame Frame) {
+	frame.Timestamp = time.Now()
+	select {
+	case r.Frames <- frame:
+	default:
+	}
+}
+
+// runWithBreakDetect frames on the BREAK that delimits every DMX packet.
+//
+// ReadChunk hands back the data that arrived before a line event together with
+// the event itself, so the break is always applied at the exact byte offset it
+// occurred at. That ordering is the whole point: a break reported even slightly
+// out of position truncates one frame and desyncs the next.
 func (r *Receiver) runWithBreakDetect(ctx context.Context) error {
-	breakCh := make(chan struct{}, 1)
-
-	// Goroutine 1: BREAK event listener
-	go func() {
-		for {
-			if err := r.port.WaitForBreak(ctx); err != nil {
-				if ctx.Err() != nil {
-					return
-				}
-				continue
-			}
-			select {
-			case breakCh <- struct{}{}:
-			default:
-			}
-		}
-	}()
-
-	// Goroutine 2: Data reader with BREAK awareness
 	buf := make([]byte, 1024)
 	var frame Frame
 	state := stateWaitBreak
@@ -56,45 +63,14 @@ func (r *Receiver) runWithBreakDetect(ctx context.Context) error {
 			return ctx.Err()
 		}
 
-		// Check for BREAK signal
-		select {
-		case <-breakCh:
-			// If we were reading data, emit the completed frame
-			if state == stateReadData && frame.Length > 0 {
-				frame.Timestamp = time.Now()
-				select {
-				case r.Frames <- frame:
-				default:
-				}
-			}
-			frame = Frame{}
-			state = stateWaitStartCode
-		default:
-		}
-
-		if state == stateWaitBreak {
-			// Just wait for BREAK, don't read
-			select {
-			case <-breakCh:
-				state = stateWaitStartCode
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-			continue
-		}
-
-		n, err := r.port.Read(buf)
+		n, marker, err := r.port.ReadChunk(buf)
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			// Read error — reset to wait for next BREAK
-			state = stateWaitBreak
-			continue
-		}
-
-		if n == 0 {
-			continue
+			// Surface it rather than looping. A persistent error here means the
+			// adapter is gone; retrying in a tight loop would just burn a core.
+			return fmt.Errorf("read: %w", err)
 		}
 
 		for i := 0; i < n; i++ {
@@ -104,7 +80,7 @@ func (r *Receiver) runWithBreakDetect(ctx context.Context) error {
 				if buf[i] == StartCodeDMX {
 					state = stateReadData
 				} else {
-					// Non-DMX start code, skip this frame
+					// Alternate start code (RDM, text packet, ...) — not ours.
 					state = stateWaitBreak
 				}
 
@@ -113,80 +89,113 @@ func (r *Receiver) runWithBreakDetect(ctx context.Context) error {
 					frame.Channels[frame.Length] = buf[i]
 					frame.Length++
 				}
+
+				// stateWaitBreak: discard until the next break resyncs us.
 			}
 		}
 
-		// Check for BREAK again after read (may have arrived during read)
-		select {
-		case <-breakCh:
-			if frame.Length > 0 {
-				frame.Timestamp = time.Now()
-				select {
-				case r.Frames <- frame:
-				default:
-				}
+		switch marker {
+		case MarkerBreak:
+			if state == stateReadData && frame.Length > 0 {
+				r.emit(frame)
 			}
 			frame = Frame{}
 			state = stateWaitStartCode
-		default:
+
+		case MarkerError:
+			// Framing/parity error or overrun: the frame in flight is suspect.
+			frame = Frame{}
+			state = stateWaitBreak
 		}
 	}
 }
 
-// runFallback uses read timeouts to detect frame boundaries (no BREAK detection).
+// runFallback frames without trusting BREAK detection.
+//
+// It anchors on length: DMX packets carry a start code plus up to 512 channel
+// bytes, so after 512 channels the next byte is the following packet's start
+// code. That holds sync indefinitely against any source sending full-size
+// frames, and it is the only mechanism here that works on real hardware.
+//
+// The idle gap is a resync hint only, never the primary boundary. At 44fps the
+// mark-before-break is about 96us, while an FTDI adapter's latency timer batches
+// USB transfers on a millisecond scale — the wire timing simply does not survive
+// to userspace, so a gap threshold cannot resolve the break. Sources that send
+// short frames still need it to find the boundary at all, which is why it stays.
 func (r *Receiver) runFallback(ctx context.Context) error {
 	buf := make([]byte, 1024)
 	var frame Frame
 	state := stateWaitBreak
-	lastRead := time.Now()
+	lastData := time.Now()
+
+	gap := r.GapThreshold
+	if gap <= 0 {
+		gap = DefaultGapThreshold
+	}
 
 	fmt.Println("Running in fallback mode (no BREAK detection)")
-	fmt.Println("Using read timeout gaps to detect frame boundaries...")
+	fmt.Printf("Framing on packet length, resyncing on gaps over %v...\n", gap)
 
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 
-		n, err := r.port.Read(buf)
+		n, marker, err := r.port.ReadChunk(buf)
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			continue
+			return fmt.Errorf("read: %w", err)
 		}
 
 		now := time.Now()
 
 		if n == 0 {
-			// Timeout with no data — if we had data, this gap is likely a BREAK
-			if state == stateReadData && frame.Length > 0 && now.Sub(lastRead) > time.Millisecond {
-				frame.Timestamp = now
-				select {
-				case r.Frames <- frame:
-				default:
-				}
+			// Idle. If a partial frame is open and the line has been quiet
+			// longer than the threshold, close it out — this is what lets a
+			// short-frame source sync at all.
+			if state == stateReadData && frame.Length > 0 && now.Sub(lastData) >= gap {
+				r.emit(frame)
 				frame = Frame{}
-				state = stateWaitBreak
+				state = stateWaitStartCode
 			}
 			continue
 		}
+		lastData = now
 
-		lastRead = now
+		// A hardware error still means resync, even here.
+		if marker == MarkerError {
+			frame = Frame{}
+			state = stateWaitBreak
+		}
 
 		for i := 0; i < n; i++ {
 			switch state {
 			case stateWaitBreak:
-				// In fallback mode, look for 0x00 bytes as potential BREAK/start code
-				if buf[i] == 0x00 {
+				// Cold start: the first zero byte is our best guess at a start
+				// code. If it was really a channel value we resync at the next
+				// length boundary.
+				if buf[i] == StartCodeDMX {
 					frame.StartCode = StartCodeDMX
 					state = stateReadData
 				}
 
+			case stateWaitStartCode:
+				frame.StartCode = buf[i]
+				if buf[i] == StartCodeDMX {
+					state = stateReadData
+				} else {
+					state = stateWaitBreak
+				}
+
 			case stateReadData:
-				if frame.Length < MaxChannels {
-					frame.Channels[frame.Length] = buf[i]
-					frame.Length++
+				frame.Channels[frame.Length] = buf[i]
+				frame.Length++
+				if frame.Length == MaxChannels {
+					r.emit(frame)
+					frame = Frame{}
+					state = stateWaitStartCode
 				}
 			}
 		}

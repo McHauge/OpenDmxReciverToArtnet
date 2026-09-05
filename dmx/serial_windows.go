@@ -1,7 +1,8 @@
+//go:build windows
+
 package dmx
 
 import (
-	"context"
 	"fmt"
 	"sync"
 	"unsafe"
@@ -10,21 +11,23 @@ import (
 )
 
 const (
-	dmxBaudRate = 250000
 	dmxByteSize = 8
 	dmxStopBits = 2 // TWOSTOPBITS
 	dmxParity   = 0 // NOPARITY
 
-	evBreak  = 0x0040
-	evRxChar = 0x0001
-	evErr    = 0x0080
-	ceBreak  = 0x0010
+	// ClearCommError status bits.
+	ceRxOver    = 0x0001
+	ceOverrun   = 0x0002
+	ceRxParity  = 0x0004
+	ceFrame     = 0x0008
+	ceBreak     = 0x0010
+	ceErrorMask = ceRxOver | ceOverrun | ceRxParity | ceFrame
 
 	purgeRxClear = 0x0008
 
 	// Read timeout: 2ms between bytes signals end of frame
-	readIntervalTimeout  = 2
-	readTotalTimeoutMult = 0
+	readIntervalTimeout   = 2
+	readTotalTimeoutMult  = 0
 	readTotalTimeoutConst = 100
 )
 
@@ -35,7 +38,7 @@ type SerialPort struct {
 }
 
 func OpenSerialPort(portName string) (*SerialPort, error) {
-	path, err := windows.UTF16PtrFromString(`\\.\` + portName)
+	path, err := windows.UTF16PtrFromString(resolvePortPath(portName))
 	if err != nil {
 		return nil, fmt.Errorf("invalid port name: %w", err)
 	}
@@ -94,17 +97,12 @@ func (sp *SerialPort) configure() error {
 
 	// Set timeouts for read operations
 	timeouts := commTimeouts{
-		ReadIntervalTimeout:         readIntervalTimeout,
-		ReadTotalTimeoutMultiplier:  readTotalTimeoutMult,
-		ReadTotalTimeoutConstant:    readTotalTimeoutConst,
+		ReadIntervalTimeout:        readIntervalTimeout,
+		ReadTotalTimeoutMultiplier: readTotalTimeoutMult,
+		ReadTotalTimeoutConstant:   readTotalTimeoutConst,
 	}
 	if err := setCommTimeouts(sp.handle, &timeouts); err != nil {
 		return fmt.Errorf("SetCommTimeouts: %w", err)
-	}
-
-	// Set comm event mask for BREAK detection
-	if err := setCommMask(sp.handle, evBreak|evRxChar|evErr); err != nil {
-		return fmt.Errorf("SetCommMask: %w", err)
 	}
 
 	return nil
@@ -125,66 +123,40 @@ func (sp *SerialPort) Read(buf []byte) (int, error) {
 	return int(n), nil
 }
 
-// WaitForBreak blocks until a BREAK condition is detected on the serial line.
-func (sp *SerialPort) WaitForBreak(ctx context.Context) error {
-	for {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-
-		var evtMask uint32
-		var ov windows.Overlapped
-		evt, err := windows.CreateEvent(nil, 1, 0, nil)
-		if err != nil {
-			return err
-		}
-		ov.HEvent = evt
-
-		err = waitCommEvent(sp.handle, &evtMask, &ov)
-		if err == windows.ERROR_IO_PENDING {
-			// Wait with context cancellation support
-			waitResult, _ := windows.WaitForSingleObject(evt, 50) // 50ms poll
-			if waitResult == uint32(windows.WAIT_TIMEOUT) {
-				windows.CancelIo(sp.handle)
-				windows.CloseHandle(evt)
-				continue
-			}
-			var transferred uint32
-			err = windows.GetOverlappedResult(sp.handle, &ov, &transferred, false)
-		}
-		windows.CloseHandle(evt)
-
-		if err != nil {
-			return err
-		}
-
-		if evtMask&evBreak != 0 {
-			// Clear the error state caused by BREAK
-			sp.clearBreakError()
-			return nil
-		}
+// ReadChunk implements Port.
+//
+// The break flag is sampled with ClearCommError immediately after the read, on
+// the same goroutine, so it is reported against the bytes it actually followed.
+// The previous design signalled breaks from a separate WaitCommEvent goroutine,
+// where the signal could overtake the data ahead of it and truncate a frame.
+//
+// This relies on the read terminating at the break, which FTDI adapters give us
+// for free: the chip sends a USB packet immediately on any line-status change
+// (BI/FE/PE). Without that, nothing here would be break-aligned — at 44fps
+// there is never a 2ms inter-byte gap for ReadIntervalTimeout to fire on.
+func (sp *SerialPort) ReadChunk(buf []byte) (int, Marker, error) {
+	n, err := sp.Read(buf)
+	if err != nil {
+		return n, MarkerNone, err
 	}
-}
 
-// CheckBreak does a non-blocking check for BREAK via ClearCommError.
-func (sp *SerialPort) CheckBreak() (bool, error) {
-	var errors uint32
+	var status uint32
 	var stat comStat
-	if err := clearCommError(sp.handle, &errors, &stat); err != nil {
-		return false, err
+	if err := clearCommError(sp.handle, &status, &stat); err != nil {
+		// Not fatal: we still have the data, just no line-event information.
+		return n, MarkerNone, nil
 	}
-	return errors&ceBreak != 0, nil
-}
 
-func (sp *SerialPort) clearBreakError() {
-	var errors uint32
-	var stat comStat
-	clearCommError(sp.handle, &errors, &stat)
+	switch {
+	case status&ceBreak != 0:
+		return n, MarkerBreak, nil
+	case status&ceErrorMask != 0:
+		return n, MarkerError, nil
+	}
+	return n, MarkerNone, nil
 }
 
 func (sp *SerialPort) Close() error {
-	// Unblock any pending WaitCommEvent by clearing the mask
-	setCommMask(sp.handle, 0)
 	windows.CloseHandle(sp.overlap.HEvent)
 	return windows.CloseHandle(sp.handle)
 }
@@ -192,21 +164,21 @@ func (sp *SerialPort) Close() error {
 // Win32 structures and syscalls
 
 type dcbStruct struct {
-	DCBlength  uint32
-	BaudRate   uint32
-	Flags      uint32
-	Reserved   uint16
-	XonLim     uint16
-	XoffLim    uint16
-	ByteSize   byte
-	Parity     byte
-	StopBits   byte
-	XonChar    byte
-	XoffChar   byte
-	ErrorChar  byte
-	EofChar    byte
-	EvtChar    byte
-	Reserved1  uint16
+	DCBlength uint32
+	BaudRate  uint32
+	Flags     uint32
+	Reserved  uint16
+	XonLim    uint16
+	XoffLim   uint16
+	ByteSize  byte
+	Parity    byte
+	StopBits  byte
+	XonChar   byte
+	XoffChar  byte
+	ErrorChar byte
+	EofChar   byte
+	EvtChar   byte
+	Reserved1 uint16
 }
 
 type commTimeouts struct {
@@ -218,9 +190,9 @@ type commTimeouts struct {
 }
 
 type comStat struct {
-	Flags    uint32
-	InQue   uint32
-	OutQue  uint32
+	Flags  uint32
+	InQue  uint32
+	OutQue uint32
 }
 
 var (
@@ -228,8 +200,6 @@ var (
 	procGetCommState    = kernel32.NewProc("GetCommState")
 	procSetCommState    = kernel32.NewProc("SetCommState")
 	procSetCommTimeouts = kernel32.NewProc("SetCommTimeouts")
-	procSetCommMask     = kernel32.NewProc("SetCommMask")
-	procWaitCommEvent   = kernel32.NewProc("WaitCommEvent")
 	procClearCommError  = kernel32.NewProc("ClearCommError")
 	procPurgeComm       = kernel32.NewProc("PurgeComm")
 )
@@ -252,26 +222,6 @@ func setCommState(handle windows.Handle, dcb *dcbStruct) error {
 
 func setCommTimeouts(handle windows.Handle, timeouts *commTimeouts) error {
 	r, _, err := procSetCommTimeouts.Call(uintptr(handle), uintptr(unsafe.Pointer(timeouts)))
-	if r == 0 {
-		return err
-	}
-	return nil
-}
-
-func setCommMask(handle windows.Handle, mask uint32) error {
-	r, _, err := procSetCommMask.Call(uintptr(handle), uintptr(mask))
-	if r == 0 {
-		return err
-	}
-	return nil
-}
-
-func waitCommEvent(handle windows.Handle, evtMask *uint32, overlapped *windows.Overlapped) error {
-	r, _, err := procWaitCommEvent.Call(
-		uintptr(handle),
-		uintptr(unsafe.Pointer(evtMask)),
-		uintptr(unsafe.Pointer(overlapped)),
-	)
 	if r == 0 {
 		return err
 	}

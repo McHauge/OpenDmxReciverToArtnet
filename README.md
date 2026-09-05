@@ -1,6 +1,6 @@
 # OpenDmxReciverToArtnet
 
-A small Windows console tool that **receives** DMX512 from a USB→DMX adapter, shows a live channel grid in the terminal, and can rebroadcast the universe as **Art-Net** — optionally HTP-merging other incoming Art-Net universes into the output.
+A small cross-platform console tool that **receives** DMX512 from a USB→DMX adapter, shows a live channel grid in the terminal, and can rebroadcast the universe as **Art-Net** — optionally HTP-merging other incoming Art-Net universes into the output.
 
 Written in Go with a single dependency (`golang.org/x/sys`). Go module path: `github.com/mc-ha/OpenDmxReciver`.
 
@@ -27,34 +27,45 @@ Developed and tested against this adapter:
 
 > **Important:** this is a *receive* application. Many cheap FTDI-based "Open DMX USB" cables are **transmit-only** and will never deliver a single byte to this tool no matter how the wiring is done. The unit linked above works for RX.
 
-The port is opened read-only as `\\.\COMx` at **250000 baud, 8 data bits, no parity, 2 stop bits (8N2)** — the DMX512 line settings. Find the COM port number in **Device Manager → Ports (COM & LPT)**.
+The port is opened at **250000 baud, 8 data bits, no parity, 2 stop bits (8N2)** — the DMX512 line settings.
+
+| OS | Device | How to find it |
+|---|---|---|
+| Windows | `\\.\COM3` | Device Manager → Ports (COM & LPT) |
+| macOS | `/dev/cu.usbserial-XXXX` | `ls /dev/cu.*` |
+| Linux | `/dev/ttyUSB0` | `ls /dev/ttyUSB* /dev/ttyACM*` (you may need the `dialout` group) |
+
+With no port argument the tool auto-detects a single attached adapter, which is
+the easy path on macOS where the device name embeds the adapter's serial number.
 
 ## Requirements
 
-- **Windows only.** Serial I/O is done with direct `kernel32.dll` syscalls ([dmx/serial.go](dmx/serial.go)) and the console output uses Windows VT escape sequences ([display/console.go](display/console.go)). This will not build or run on Linux/macOS without porting.
+- **Windows, macOS and Linux.** Serial I/O is platform-split: `kernel32.dll` syscalls on Windows ([dmx/serial_windows.go](dmx/serial_windows.go)), termios on POSIX ([dmx/serial_unix.go](dmx/serial_unix.go)) with the non-standard 250000 baud rate applied via `IOSSIOSPEED` on macOS and `BOTHER`/`TCSETS2` on Linux.
 - Go **1.26.1** or newer to build.
 - Dependency: `golang.org/x/sys v0.42.0` (only).
 
 ## Build
 
 ```bash
-go build -o OpenDmxReciver.exe .
+go build -o OpenDmxReciver .          # macOS / Linux
+go build -o OpenDmxReciver.exe .      # Windows
 ```
 
 ## Quick start
 
 ```bash
 # Full channel grid on COM3
-OpenDmxReciver.exe COM3
+OpenDmxReciver.exe COM3          # Windows
+./OpenDmxReciver                 # macOS/Linux, auto-detect the adapter
 
 # Just a status + FPS line
-OpenDmxReciver.exe -quiet COM3
+./OpenDmxReciver -quiet /dev/cu.usbserial-A1B2C3
 
 # Forward the incoming DMX to Art-Net universe 0 on the local broadcast address
-OpenDmxReciver.exe -artnet -artnet-dest 192.168.1.255 -artnet-universe 0 COM3
+./OpenDmxReciver -artnet -artnet-dest 192.168.1.255 -artnet-universe 0
 
 # Also merge incoming Art-Net universes 1 and 2 into output universe 0 (HTP)
-OpenDmxReciver.exe -artnet -merge-inputs 1:0,2:0 COM3
+./OpenDmxReciver -artnet -merge-inputs 1:0,2:0
 ```
 
 ## How it works
@@ -81,7 +92,7 @@ The DMX receiver, the display loop and the Art-Net listener each run as goroutin
 ## CLI flags
 
 ```
-Usage: OpenDmxReciver.exe [flags] <COM port>
+Usage: OpenDmxReciver [flags] <serial port>
 ```
 
 | Flag | Default | Description |
@@ -207,9 +218,8 @@ DMX Receiving | 44.0 fps | 512 channels
 go test ./...
 ```
 
-52 tests cover `artnet/`, `config/` and `merge/`. `dmx/` and `display/` are not covered — they are thin wrappers over Windows syscalls.
+84 tests cover `artnet/` (20), `config/` (17), `dmx/` (30) and `merge/` (17). The `dmx/` tests exercise the PARMRK break decoder and the receiver state machine through a fake port, so they run on every platform. `display/` is not covered.
 
-> Known failure: `TestDecodeArtDmxRoundTrip` still asserts that a 256-channel frame round-trips with `Length == 256`, but `EncodeArtDmx` now always emits a full 512-channel packet, so it decodes back as 512. The test needs updating to match the fixed-length behaviour.
 
 ## License
 
