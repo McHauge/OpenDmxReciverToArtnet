@@ -36,7 +36,11 @@ func main() {
 	}
 
 	channels := flag.Int("channels", cfg.Channels, "number of DMX channels to display (1-512)")
-	noBreakDetect := flag.Bool("no-break-detect", cfg.NoBreakDetect, "fallback mode: use read timeouts instead of BREAK detection")
+	// On platforms whose driver cannot report BREAK (macOS), default to the
+	// length-anchored fallback — otherwise the tool looks broken out of the box.
+	// Pass -no-break-detect=false to override.
+	noBreakDetect := flag.Bool("no-break-detect", cfg.NoBreakDetect || !dmx.BreakDetectSupported,
+		"fallback mode: frame on packet length instead of BREAK detection")
 	quiet := flag.Bool("quiet", cfg.Quiet, "show only receive status and FPS changes instead of full channel grid")
 	artnetEnabled := flag.Bool("artnet", cfg.ArtnetEnabled, "enable Art-Net output")
 	artnetDest := flag.String("artnet-dest", cfg.ArtnetDest, "Art-Net destination IP (broadcast or unicast)")
@@ -45,10 +49,12 @@ func main() {
 	mergeInputsStr := flag.String("merge-inputs", "", "Art-Net merge inputs as source:output pairs (e.g., 1:0,2:0)")
 	mergeTimeout := flag.Int("merge-timeout", cfg.MergeTimeout, "timeout in seconds for Art-Net merge sources (0 = persist forever)")
 	debugArtnet := flag.Bool("debug-artnet", false, "enable verbose Art-Net receive logging")
+	gapThreshold := flag.Int("gap-threshold", 2, "fallback mode only: idle milliseconds that close out a short frame")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s [flags] <COM port>\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s [flags] <serial port>\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Open DMX USB Receiver — reads DMX512 data and displays channel values.\n\n")
-		fmt.Fprintf(os.Stderr, "Example: %s COM3\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Example: %s %s\n", os.Args[0], dmx.PortExample())
+		fmt.Fprintf(os.Stderr, "With no port given, a single attached adapter is detected automatically.\n\n")
 		fmt.Fprintf(os.Stderr, "Flags:\n")
 		flag.PrintDefaults()
 	}
@@ -65,8 +71,26 @@ func main() {
 		portName = cfg.ComPort
 	}
 	if portName == "" {
-		flag.Usage()
-		os.Exit(1)
+		// Nothing given and nothing configured. On macOS the device name embeds
+		// the adapter's serial number, so looking it up by hand is a real chore
+		// — detect it instead when the choice is unambiguous.
+		ports, _ := dmx.ListPorts()
+		switch len(ports) {
+		case 0:
+			fmt.Fprintf(os.Stderr, "No serial port given, and none detected.\n")
+			fmt.Fprintf(os.Stderr, "Hint: %s\n\n", dmx.PortHint())
+			flag.Usage()
+			os.Exit(1)
+		case 1:
+			portName = ports[0]
+			fmt.Printf("Auto-detected serial port: %s\n", portName)
+		default:
+			fmt.Fprintf(os.Stderr, "Several serial ports detected — pass one as an argument:\n")
+			for _, p := range ports {
+				fmt.Fprintf(os.Stderr, "  %s\n", p)
+			}
+			os.Exit(1)
+		}
 	}
 
 	fmt.Printf("Opening %s at 250000 baud (8N2)...\n", portName)
@@ -76,8 +100,14 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		fmt.Fprintf(os.Stderr, "\nTroubleshooting:\n")
 		fmt.Fprintf(os.Stderr, "  - Is the Open DMX USB adapter plugged in?\n")
-		fmt.Fprintf(os.Stderr, "  - Is %s the correct COM port? (Check Device Manager)\n", portName)
+		fmt.Fprintf(os.Stderr, "  - Is %s the right port? %s\n", portName, dmx.PortHint())
 		fmt.Fprintf(os.Stderr, "  - Is another application using the port?\n")
+		if ports, _ := dmx.ListPorts(); len(ports) > 0 {
+			fmt.Fprintf(os.Stderr, "\nDetected serial ports:\n")
+			for _, p := range ports {
+				fmt.Fprintf(os.Stderr, "  %s\n", p)
+			}
+		}
 		os.Exit(1)
 	}
 	defer port.Close()
@@ -88,6 +118,7 @@ func main() {
 	defer stop()
 
 	receiver := dmx.NewReceiver(port, *noBreakDetect)
+	receiver.GapThreshold = time.Duration(*gapThreshold) * time.Millisecond
 	console := display.NewConsole(*channels, *quiet)
 
 	var node *artnet.Node

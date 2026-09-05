@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/mc-ha/OpenDmxReciver/dmx"
@@ -18,12 +20,12 @@ type ReceivedFrame struct {
 
 // Node sends ArtDmx packets and responds to ArtPoll discovery.
 type Node struct {
-	conn           *net.UDPConn
-	dest           *net.UDPAddr
-	universe       uint16
-	seq            byte
-	localIP        net.IP
-	ReceivedDmx    chan ReceivedFrame
+	conn            *net.UDPConn
+	dest            *net.UDPAddr
+	universe        uint16
+	seq             byte
+	localIP         net.IP
+	ReceivedDmx     chan ReceivedFrame
 	outputUniverses map[uint16]bool // universes we send on (for loopback filtering)
 	debug           bool
 }
@@ -52,12 +54,10 @@ func NewNode(bindAddr string, dest string, universe uint16) (*Node, error) {
 
 	// Bind to 0.0.0.0 so we can receive broadcast Art-Net packets.
 	// The bindAddr is used for ArtPollReply and loopback detection only.
-	localAddr := &net.UDPAddr{IP: nil, Port: Port}
-	conn, err := net.ListenUDP("udp4", localAddr)
+	conn, err := listenBroadcastUDP(Port)
 	if err != nil {
 		// Port 6454 may be in use — fall back to ephemeral port
-		localAddr.Port = 0
-		conn, err = net.ListenUDP("udp4", localAddr)
+		conn, err = listenBroadcastUDP(0)
 		if err != nil {
 			return nil, fmt.Errorf("bind UDP: %w", err)
 		}
@@ -169,14 +169,48 @@ func (n *Node) Close() {
 	n.conn.Close()
 }
 
+// listenBroadcastUDP binds a UDP socket on the given port with SO_BROADCAST
+// enabled, so sends to a broadcast address are permitted on every platform.
+func listenBroadcastUDP(port int) (*net.UDPConn, error) {
+	lc := net.ListenConfig{
+		Control: func(_, _ string, c syscall.RawConn) error {
+			return setBroadcast(c)
+		},
+	}
+
+	pc, err := lc.ListenPacket(context.Background(), "udp4", net.JoinHostPort("", strconv.Itoa(port)))
+	if err != nil {
+		return nil, err
+	}
+
+	conn, ok := pc.(*net.UDPConn)
+	if !ok {
+		pc.Close()
+		return nil, fmt.Errorf("expected *net.UDPConn, got %T", pc)
+	}
+	return conn, nil
+}
+
 // detectLocalIP finds the local IP address that routes toward the given destination.
 func detectLocalIP(dest *net.UDPAddr) net.IP {
-	conn, err := net.DialUDP("udp4", nil, dest)
+	// Dial through the same SO_BROADCAST path as the listener: on Linux a
+	// broadcast destination needs the option even here, and failing would leave
+	// us reporting 0.0.0.0 as the local IP in every ArtPollReply.
+	d := net.Dialer{
+		Control: func(_, _ string, c syscall.RawConn) error {
+			return setBroadcast(c)
+		},
+	}
+
+	conn, err := d.Dial("udp4", dest.String())
 	if err != nil {
 		return net.IPv4(0, 0, 0, 0)
 	}
 	defer conn.Close()
 
-	localAddr := conn.LocalAddr().(*net.UDPAddr)
+	localAddr, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		return net.IPv4(0, 0, 0, 0)
+	}
 	return localAddr.IP
 }

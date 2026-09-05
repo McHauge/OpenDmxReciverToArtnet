@@ -1,6 +1,6 @@
 # OpenDmxReciverToArtnet
 
-A small Windows console tool that **receives** DMX512 from a USB→DMX adapter, shows a live channel grid in the terminal, and can rebroadcast the universe as **Art-Net** — optionally HTP-merging other incoming Art-Net universes into the output.
+A small cross-platform console tool that **receives** DMX512 from a USB→DMX adapter, shows a live channel grid in the terminal, and can rebroadcast the universe as **Art-Net** — optionally HTP-merging other incoming Art-Net universes into the output.
 
 Written in Go with a single dependency (`golang.org/x/sys`). Go module path: `github.com/mc-ha/OpenDmxReciver`.
 
@@ -27,34 +27,70 @@ Developed and tested against this adapter:
 
 > **Important:** this is a *receive* application. Many cheap FTDI-based "Open DMX USB" cables are **transmit-only** and will never deliver a single byte to this tool no matter how the wiring is done. The unit linked above works for RX.
 
-The port is opened read-only as `\\.\COMx` at **250000 baud, 8 data bits, no parity, 2 stop bits (8N2)** — the DMX512 line settings. Find the COM port number in **Device Manager → Ports (COM & LPT)**.
+The port is opened at **250000 baud, 8 data bits, no parity, 2 stop bits (8N2)** — the DMX512 line settings.
+
+| OS | Device | How to find it |
+|---|---|---|
+| Windows | `\\.\COM3` | Device Manager → Ports (COM & LPT) |
+| macOS | `/dev/cu.usbserial-XXXX` | `ls /dev/cu.*` |
+| Linux | `/dev/ttyUSB0` | `ls /dev/ttyUSB* /dev/ttyACM*` (you may need the `dialout` group) |
+
+With no port argument the tool auto-detects a single attached adapter, which is
+the easy path on macOS where the device name embeds the adapter's serial number.
+
+### BREAK detection per platform
+
+DMX packets are delimited by a BREAK. Windows reports it via `ClearCommError`,
+and Linux's `ftdi_sio` driver reports it to the tty layer where `PARMRK` escapes
+it into the read stream as `FF 00 00`.
+
+**macOS reports no break, but the signal survives anyway.** Apple's
+`AppleUSBFTDI` never passes BREAK to the tty layer — verified against an
+SH-RS09B on macOS 15 with a live 44fps source: the termios flags read back
+correctly and data arrives at the right rate, yet zero `FF 00 00` sequences
+appear where ~88 per two seconds should, and setting `IGNBRK` changes nothing.
+
+What does survive is the FTDI chip's own behaviour. The UART turns the break
+into a stray `0x00` data byte, and the line idling through the break makes the
+chip flush a partial USB packet. So a read shorter than the 62-byte payload
+marks a frame end, giving a 514-byte cadence (513 for the packet, one for the
+stray byte).
+
+That inference is noisy — the tty layer delivers data incrementally, so roughly
+one read in six ends short for unrelated reasons. The receiver therefore learns
+the source's packet length by majority vote over the first 24 breaks, then
+frames on length and uses breaks only to recover phase. Measured result: 412
+consecutive frames, all exactly 512 channels, at 43.8fps against a theoretical
+44.1.
 
 ## Requirements
 
-- **Windows only.** Serial I/O is done with direct `kernel32.dll` syscalls ([dmx/serial.go](dmx/serial.go)) and the console output uses Windows VT escape sequences ([display/console.go](display/console.go)). This will not build or run on Linux/macOS without porting.
+- **Windows, macOS and Linux.** Serial I/O is platform-split: `kernel32.dll` syscalls on Windows ([dmx/serial_windows.go](dmx/serial_windows.go)), termios on POSIX ([dmx/serial_unix.go](dmx/serial_unix.go)) with the non-standard 250000 baud rate applied via `IOSSIOSPEED` on macOS and `BOTHER`/`TCSETS2` on Linux.
 - Go **1.26.1** or newer to build.
 - Dependency: `golang.org/x/sys v0.42.0` (only).
 
 ## Build
 
 ```bash
-go build -o OpenDmxReciver.exe .
+go build -o OpenDmxReciver .          # macOS / Linux
+go build -o OpenDmxReciver.exe .      # Windows
 ```
 
 ## Quick start
 
 ```bash
 # Full channel grid on COM3
-OpenDmxReciver.exe COM3
+OpenDmxReciver.exe COM3          # Windows
+./OpenDmxReciver                 # macOS/Linux, auto-detect the adapter
 
 # Just a status + FPS line
-OpenDmxReciver.exe -quiet COM3
+./OpenDmxReciver -quiet /dev/cu.usbserial-A1B2C3
 
 # Forward the incoming DMX to Art-Net universe 0 on the local broadcast address
-OpenDmxReciver.exe -artnet -artnet-dest 192.168.1.255 -artnet-universe 0 COM3
+./OpenDmxReciver -artnet -artnet-dest 192.168.1.255 -artnet-universe 0
 
 # Also merge incoming Art-Net universes 1 and 2 into output universe 0 (HTP)
-OpenDmxReciver.exe -artnet -merge-inputs 1:0,2:0 COM3
+./OpenDmxReciver -artnet -merge-inputs 1:0,2:0
 ```
 
 ## How it works
@@ -81,7 +117,7 @@ The DMX receiver, the display loop and the Art-Net listener each run as goroutin
 ## CLI flags
 
 ```
-Usage: OpenDmxReciver.exe [flags] <COM port>
+Usage: OpenDmxReciver [flags] <serial port>
 ```
 
 | Flag | Default | Description |
@@ -207,9 +243,8 @@ DMX Receiving | 44.0 fps | 512 channels
 go test ./...
 ```
 
-52 tests cover `artnet/`, `config/` and `merge/`. `dmx/` and `display/` are not covered — they are thin wrappers over Windows syscalls.
+95 tests cover `artnet/` (20), `config/` (17), `dmx/` (41) and `merge/` (17). The `dmx/` tests exercise the PARMRK break decoder and the receiver state machine through a fake port, so they run on every platform. `display/` is not covered.
 
-> Known failure: `TestDecodeArtDmxRoundTrip` still asserts that a 256-channel frame round-trips with `Length == 256`, but `EncodeArtDmx` now always emits a full 512-channel packet, so it decodes back as 512. The test needs updating to match the fixed-length behaviour.
 
 ## License
 
