@@ -36,7 +36,11 @@ func main() {
 	}
 
 	channels := flag.Int("channels", cfg.Channels, "number of DMX channels to display (1-512)")
-	noBreakDetect := flag.Bool("no-break-detect", cfg.NoBreakDetect, "fallback mode: use read timeouts instead of BREAK detection")
+	// On platforms whose driver cannot report BREAK (macOS), default to the
+	// length-anchored fallback — otherwise the tool looks broken out of the box.
+	// Pass -no-break-detect=false to override.
+	noBreakDetect := flag.Bool("no-break-detect", cfg.NoBreakDetect || !dmx.BreakDetectSupported,
+		"fallback mode: frame on packet length instead of BREAK detection")
 	quiet := flag.Bool("quiet", cfg.Quiet, "show only receive status and FPS changes instead of full channel grid")
 	artnetEnabled := flag.Bool("artnet", cfg.ArtnetEnabled, "enable Art-Net output")
 	artnetDest := flag.String("artnet-dest", cfg.ArtnetDest, "Art-Net destination IP (broadcast or unicast)")

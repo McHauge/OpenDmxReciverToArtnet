@@ -13,7 +13,7 @@ go build -o OpenDmxReciver .              # .exe on Windows
 
 CLI flags override values from `settings.properties`. Run with no args to use file-based config.
 
-`go test ./...` runs 84 passing tests: `artnet/` (20), `config/` (17), `dmx/` (30), `merge/` (17). `display/` is untested. No CI/CD pipeline.
+`go test ./...` runs 95 passing tests: `artnet/` (20), `config/` (17), `dmx/` (41), `merge/` (17). `display/` is untested. No CI/CD pipeline.
 
 ## Platform
 
@@ -26,6 +26,8 @@ CLI flags override values from `settings.properties`. Run with no args to use fi
 - `artnet/sockopt_{unix,windows}.go` — `SO_BROADCAST`.
 
 POSIX has no `WaitCommEvent`, so BREAK arrives in-band via `PARMRK` as `FF 00 00` and is decoded in `dmx/parmrk.go`. `Port.ReadChunk` returns data and the line event together, which is what keeps breaks aligned to the byte offset they occurred at.
+
+**macOS gets no BREAK from the driver** — `AppleUSBFTDI` never passes it to the tty layer, and `IGNBRK` confirms the tty never sees one. Instead the FTDI emits the break as a stray `0x00` and flushes a partial USB packet, so a read under 62 bytes marks a frame end (`breakFromShortRead` in `dmx/serial_darwin.go`); the stray byte is consumed by `stateSkipTrailer`. That inference is noisy, so `breakValidator` learns the source's packet length by majority vote and then frames on length, using breaks only for phase recovery. Windows and Linux report BREAK directly and skip all of this.
 
 ## Architecture
 

@@ -82,3 +82,29 @@ func PortExample() string { return "/dev/cu.usbserial-A1B2C3" }
 
 // PortHint tells the user how to find their adapter.
 func PortHint() string { return "run `ls /dev/cu.*` to list serial devices" }
+
+// Apple's AppleUSBFTDI driver does not report BREAK to the tty layer, so PARMRK
+// never escapes one into the read stream — measured against a DSD TECH SH-RS09B
+// on macOS 15 with a live 44fps source: PARMRK/INPCK read back set and
+// IGNBRK/BRKINT/IGNPAR clear, yet zero FF 00 00 sequences in two seconds where
+// ~88 breaks should appear. Setting IGNBRK changes nothing, which shows the tty
+// layer never sees a break at all.
+//
+// What does survive is the FTDI chip's own behaviour. The UART turns the break
+// into a 0x00 data byte (the BI status flag that would label it is stripped by
+// the driver), and because the line then idles through the break and
+// mark-after-break, the chip flushes a partial USB packet. So a read shorter
+// than the 62-byte payload marks the end of a frame, and the next byte is the
+// start code.
+//
+// Measured: 76 of 76 short reads were followed by 0x00, with a consistent
+// 514-byte spacing — 513 for the packet plus the break's stray byte, which the
+// receiver discards when the channel count is already full.
+const (
+	BreakDetectSupported = true
+	breakFromShortRead   = true
+
+	// usbPayloadSize is an FTDI bulk-in packet (64 bytes) less its two status
+	// bytes. A read below this means the adapter's buffer drained.
+	usbPayloadSize = 62
+)

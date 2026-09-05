@@ -3,6 +3,7 @@ package dmx
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -46,6 +47,9 @@ func collect(t *testing.T, port Port, noBreakDetect bool, timeout time.Duration)
 	defer cancel()
 
 	r := NewReceiver(port, noBreakDetect)
+	// These cases cover the path where the driver reports BREAK itself, so
+	// every marker is trustworthy. The inferred path has its own tests.
+	r.inferBreaks = false
 	done := make(chan struct{})
 	go func() { defer close(done); _ = r.Run(ctx) }()
 
@@ -247,5 +251,156 @@ func TestReceiverContextCancel(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run did not return after cancel")
+	}
+}
+
+func TestFindAlignment(t *testing.T) {
+	// Three back-to-back packets with recognisable, mostly non-zero channels.
+	packet := append([]byte{StartCodeDMX}, channels(MaxChannels)...)
+	var stream []byte
+	for i := 0; i < 3; i++ {
+		stream = append(stream, packet...)
+	}
+
+	for _, skip := range []int{0, 1, 7, 256, 512} {
+		t.Run(fmt.Sprintf("skip=%d", skip), func(t *testing.T) {
+			off, ok := findAlignment(stream[skip:])
+			if !ok {
+				t.Fatalf("no alignment found after skipping %d bytes", skip)
+			}
+			want := (PacketSize - skip%PacketSize) % PacketSize
+			if off != want {
+				t.Errorf("offset = %d, want %d", off, want)
+			}
+			if stream[skip+off] != StartCodeDMX {
+				t.Errorf("offset %d does not land on a start code", off)
+			}
+		})
+	}
+}
+
+func TestFindAlignmentNeedsTwoPackets(t *testing.T) {
+	packet := append([]byte{StartCodeDMX}, channels(MaxChannels)...)
+	if _, ok := findAlignment(packet); ok {
+		t.Error("claimed alignment from a single packet; two are needed to confirm the stride")
+	}
+}
+
+func TestFindAlignmentAllZeroUniverse(t *testing.T) {
+	// Every offset is equally valid when the universe is dark; any answer is
+	// correct, but it must commit to one rather than stalling forever.
+	off, ok := findAlignment(make([]byte, 3*PacketSize))
+	if !ok {
+		t.Fatal("no alignment found in an all-zero stream")
+	}
+	if off != 0 {
+		t.Errorf("offset = %d, want 0 for an all-zero stream", off)
+	}
+}
+
+// --- inferred-break path (macOS), where markers need vetting ---
+
+func TestReceiverInferredBreaksRejectSpurious(t *testing.T) {
+	const frames = 60
+	packet := append([]byte{StartCodeDMX}, channels(MaxChannels)...)
+	packet = append(packet, 0x00) // the break's trailing byte
+
+	// Model the adapter: 62-byte USB payloads within a frame, then a short read
+	// at the boundary carrying the inferred break. Spurious breaks are injected
+	// mid-frame, which is the failure measured on hardware.
+	var steps []step
+	spurious := map[int]bool{7: true, 19: true, 40: true, 77: true, 103: true}
+	chunk := 0
+	for f := 0; f < frames; f++ {
+		for pos := 0; pos < len(packet); pos += 62 {
+			end := min(pos+62, len(packet))
+			m := MarkerNone
+			if end == len(packet) {
+				m = MarkerBreak // true boundary, on a short read
+			} else if spurious[chunk] {
+				m = MarkerBreak // noise
+			}
+			steps = append(steps, step{data: packet[pos:end], marker: m})
+			chunk++
+		}
+	}
+	steps = append(steps, step{err: errors.New("stop")})
+
+	r := NewReceiver(&fakePort{steps: steps}, false)
+	r.inferBreaks = true
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	done := make(chan struct{})
+	go func() { defer close(done); _ = r.Run(ctx) }()
+
+	var got []Frame
+	for loop := true; loop; {
+		select {
+		case f := <-r.Frames:
+			got = append(got, f)
+		case <-done:
+			loop = false
+		case <-ctx.Done():
+			loop = false
+		}
+	}
+
+	if len(got) == 0 {
+		t.Fatal("no frames emitted from an inferred-break stream")
+	}
+	want := channels(MaxChannels)
+	for i, f := range got {
+		if f.Length != MaxChannels {
+			t.Fatalf("frame %d: Length = %d, want %d — a spurious break was accepted",
+				i, f.Length, MaxChannels)
+		}
+		for c := 0; c < 24; c++ {
+			if f.Channels[c] != want[c] {
+				t.Fatalf("frame %d channel %d = %d, want %d — frame is misaligned",
+					i, c, f.Channels[c], want[c])
+			}
+		}
+	}
+}
+
+func TestBreakValidatorLocksOntoModalLength(t *testing.T) {
+	v := newBreakValidator(true)
+
+	// Real breaks at 512, spurious ones scattered.
+	spurious := []int{3, 117, 4, 260, 9}
+	for i := 0; i < breakVoteWindow; i++ {
+		length := MaxChannels
+		if i%5 == 4 {
+			length = spurious[i/5%len(spurious)]
+		}
+		boundary, publish := v.classify(length)
+		if !boundary {
+			t.Errorf("while learning, break %d was not treated as a boundary", i)
+		}
+		if publish {
+			t.Errorf("while learning, break %d was published before the lock", i)
+		}
+	}
+
+	if v.locked != MaxChannels {
+		t.Fatalf("locked onto %d, want %d", v.locked, MaxChannels)
+	}
+
+	if boundary, publish := v.classify(MaxChannels); !boundary || !publish {
+		t.Error("a break at the locked length must be accepted and published")
+	}
+	if boundary, publish := v.classify(37); boundary || publish {
+		t.Error("a break at a non-locked length must be rejected")
+	}
+}
+
+func TestBreakValidatorPassesThroughWhenNotInferring(t *testing.T) {
+	v := newBreakValidator(false)
+	for _, length := range []int{1, 512, 99, 512} {
+		boundary, publish := v.classify(length)
+		if !boundary || !publish {
+			t.Errorf("length %d: driver-reported breaks must pass through unvetted", length)
+		}
 	}
 }

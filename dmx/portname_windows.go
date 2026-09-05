@@ -48,3 +48,10 @@ func PortExample() string { return "COM3" }
 
 // PortHint tells the user how to find their adapter.
 func PortHint() string { return "check Device Manager under Ports (COM & LPT)" }
+
+// Windows reports BREAK directly through ClearCommError's CE_BREAK bit, so
+// there is no need to infer boundaries from read sizes.
+const (
+	BreakDetectSupported = true
+	breakFromShortRead   = false
+)

@@ -32,10 +32,11 @@ type SerialPort struct {
 	name     string
 	pollable bool
 
-	dec   parmrkDecoder
-	carry []byte // read but not yet decoded; empty whenever we read again
-	out   []byte // decoded, not yet returned to the caller
-	mark  Marker // event pending once out drains
+	dec          parmrkDecoder
+	carry        []byte // read but not yet decoded; empty whenever we read again
+	out          []byte // decoded, not yet returned to the caller
+	mark         Marker // event pending once out drains
+	pendingBreak bool   // a short read is waiting to be reported as a break
 
 	carryBuf [rawBufSize]byte
 	outBuf   [rawBufSize]byte
@@ -63,9 +64,14 @@ func OpenSerialPort(portName string) (*SerialPort, error) {
 		return nil, fmt.Errorf("cannot wrap %s", path)
 	}
 
-	// If deadlines are unavailable the fd did not make it into the poller; the
-	// VMIN/VTIME settings below still bound each read at ~100ms.
 	sp.pollable = sp.f.SetReadDeadline(time.Time{}) == nil
+	if !sp.pollable {
+		// No deadline support, so the timeout has to come from VTIME instead.
+		if err := blockingTermios(fd); err != nil {
+			sp.f.Close()
+			return nil, fmt.Errorf("configure %s for blocking reads: %w", path, err)
+		}
+	}
 
 	return sp, nil
 }
@@ -86,14 +92,36 @@ func baseTermios() unix.Termios {
 	t.Cflag = unix.CS8 | unix.CSTOPB | unix.CREAD | unix.CLOCAL
 	t.Lflag = 0
 
-	// "Return as soon as a byte is available, or after 100ms." VTIME is in
-	// tenths of a second, so Windows' 2ms inter-byte timeout is not
-	// representable — and not needed, since it only ever made reads return
-	// later. Framing comes from BREAK, not from read boundaries.
-	t.Cc[unix.VMIN] = 0
-	t.Cc[unix.VTIME] = 1
+	// VMIN=1 means a read never completes with zero bytes. That matters more
+	// than it looks: os.File is built with ZeroReadIsEOF, so under VMIN=0 an
+	// idle line returns 0 bytes and surfaces as a spurious io.EOF on every
+	// read after the first. With VMIN=1 an idle fd yields EAGAIN, which the
+	// runtime poller absorbs, the read deadline supplies the timeout, and a
+	// zero-byte read once again means a genuine hangup.
+	//
+	// VTIME is unused here (tenths of a second cannot express anything useful
+	// at this data rate); the deadline in ReadChunk bounds the wait instead.
+	t.Cc[unix.VMIN] = 1
+	t.Cc[unix.VTIME] = 0
+
+	// A placeholder standard rate, replaced by applyTermios with the real
+	// 250000. It has to be a legal rate: leaving these zero means B0, which
+	// asks the driver to hang up the line, and an FTDI adapter rejects that
+	// outright with EINVAL rather than ignoring it.
+	t.Ispeed, t.Ospeed = 9600, 9600
 
 	return t
+}
+
+// blockingTermios adapts the line settings for the case where the fd did not
+// make it into the runtime poller. Without the poller there is no read
+// deadline, so VTIME has to provide the timeout itself and VMIN must be 0 for
+// it to apply — which reintroduces zero-byte reads, handled in ReadChunk.
+func blockingTermios(fd int) error {
+	t := baseTermios()
+	t.Cc[unix.VMIN] = 0
+	t.Cc[unix.VTIME] = 1 // 100ms, matching readTimeout
+	return applyTermios(fd, &t, dmxBaudRate)
 }
 
 func configurePort(fd int) error {
@@ -145,6 +173,10 @@ func (sp *SerialPort) ReadChunk(buf []byte) (int, Marker, error) {
 		if len(sp.carry) > 0 {
 			out, m, consumed := sp.dec.decode(sp.outBuf[:0], sp.carry)
 			sp.carry = sp.carry[consumed:]
+			if m == MarkerNone && len(sp.carry) == 0 && sp.pendingBreak {
+				m = MarkerBreak
+				sp.pendingBreak = false
+			}
 			sp.out, sp.mark = out, m
 			continue
 		}
@@ -170,6 +202,14 @@ func (sp *SerialPort) ReadChunk(buf []byte) (int, Marker, error) {
 			return 0, MarkerNone, err
 		}
 		sp.carry = sp.carryBuf[:n]
+
+		// A read shorter than the adapter's USB payload means its buffer
+		// drained, which on a continuously transmitting DMX line only happens
+		// during the BREAK. Where the driver reports no break of its own, that
+		// flush is the break signal. See breakFromShortRead.
+		if breakFromShortRead && n < usbPayloadSize {
+			sp.pendingBreak = true
+		}
 	}
 }
 

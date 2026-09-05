@@ -38,6 +38,31 @@ The port is opened at **250000 baud, 8 data bits, no parity, 2 stop bits (8N2)**
 With no port argument the tool auto-detects a single attached adapter, which is
 the easy path on macOS where the device name embeds the adapter's serial number.
 
+### BREAK detection per platform
+
+DMX packets are delimited by a BREAK. Windows reports it via `ClearCommError`,
+and Linux's `ftdi_sio` driver reports it to the tty layer where `PARMRK` escapes
+it into the read stream as `FF 00 00`.
+
+**macOS reports no break, but the signal survives anyway.** Apple's
+`AppleUSBFTDI` never passes BREAK to the tty layer — verified against an
+SH-RS09B on macOS 15 with a live 44fps source: the termios flags read back
+correctly and data arrives at the right rate, yet zero `FF 00 00` sequences
+appear where ~88 per two seconds should, and setting `IGNBRK` changes nothing.
+
+What does survive is the FTDI chip's own behaviour. The UART turns the break
+into a stray `0x00` data byte, and the line idling through the break makes the
+chip flush a partial USB packet. So a read shorter than the 62-byte payload
+marks a frame end, giving a 514-byte cadence (513 for the packet, one for the
+stray byte).
+
+That inference is noisy — the tty layer delivers data incrementally, so roughly
+one read in six ends short for unrelated reasons. The receiver therefore learns
+the source's packet length by majority vote over the first 24 breaks, then
+frames on length and uses breaks only to recover phase. Measured result: 412
+consecutive frames, all exactly 512 channels, at 43.8fps against a theoretical
+44.1.
+
 ## Requirements
 
 - **Windows, macOS and Linux.** Serial I/O is platform-split: `kernel32.dll` syscalls on Windows ([dmx/serial_windows.go](dmx/serial_windows.go)), termios on POSIX ([dmx/serial_unix.go](dmx/serial_unix.go)) with the non-standard 250000 baud rate applied via `IOSSIOSPEED` on macOS and `BOTHER`/`TCSETS2` on Linux.
@@ -218,7 +243,7 @@ DMX Receiving | 44.0 fps | 512 channels
 go test ./...
 ```
 
-84 tests cover `artnet/` (20), `config/` (17), `dmx/` (30) and `merge/` (17). The `dmx/` tests exercise the PARMRK break decoder and the receiver state machine through a fake port, so they run on every platform. `display/` is not covered.
+95 tests cover `artnet/` (20), `config/` (17), `dmx/` (41) and `merge/` (17). The `dmx/` tests exercise the PARMRK break decoder and the receiver state machine through a fake port, so they run on every platform. `display/` is not covered.
 
 
 ## License

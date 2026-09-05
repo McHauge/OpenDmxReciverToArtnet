@@ -24,4 +24,8 @@ const (
 	stateWaitBreak rxState = iota
 	stateWaitStartCode
 	stateReadData
+	// stateSkipTrailer consumes the stray byte that the break leaves in the
+	// stream on platforms where the UART delivers it as data rather than as a
+	// line event. See breakFromShortRead.
+	stateSkipTrailer
 )

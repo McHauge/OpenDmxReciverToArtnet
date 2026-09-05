@@ -43,3 +43,12 @@ func PortExample() string { return "/dev/ttyUSB0" }
 func PortHint() string {
 	return "run `ls /dev/ttyUSB* /dev/ttyACM*`; you may need to be in the dialout group"
 }
+
+// Linux reports BREAK properly: ftdi_sio.c passes the status bit to the tty
+// layer, which n_tty turns into the FF 00 00 PARMRK escape. So there is no need
+// for the short-read heuristic macOS depends on.
+const (
+	BreakDetectSupported = true
+	breakFromShortRead   = false
+	usbPayloadSize       = 62
+)
