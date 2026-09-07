@@ -5,16 +5,12 @@ import (
 	"os"
 	"strings"
 	"time"
-	"unsafe"
-
-	"golang.org/x/sys/windows"
 
 	"github.com/mc-ha/OpenDmxReciver/dmx"
 )
 
 const (
-	cols                            = 16
-	enableVirtualTerminalProcessing = 0x0004
+	cols = 16
 )
 
 type Console struct {
@@ -135,23 +131,4 @@ func (c *Console) ShowWaiting() {
 	fmt.Println("DMX Universe 1 | Waiting for data...")
 	fmt.Println("Listening for DMX BREAK signal on serial port...")
 	fmt.Println("\nPress Ctrl+C to exit")
-}
-
-func enableANSI() {
-	var mode uint32
-	handle := windows.Handle(os.Stdout.Fd())
-	if err := windows.GetConsoleMode(handle, &mode); err == nil {
-		_ = setConsoleMode(handle, mode|enableVirtualTerminalProcessing)
-	}
-}
-
-var procSetConsoleMode = windows.NewLazySystemDLL("kernel32.dll").NewProc("SetConsoleMode")
-
-func setConsoleMode(handle windows.Handle, mode uint32) error {
-	r, _, err := procSetConsoleMode.Call(uintptr(handle), uintptr(mode))
-	_ = unsafe.Sizeof(r) // suppress unused
-	if r == 0 {
-		return err
-	}
-	return nil
 }

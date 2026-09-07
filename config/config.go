@@ -146,7 +146,9 @@ const defaultTemplate = `# OpenDmxReciver Settings
 # Lines starting with # are comments. Blank lines are ignored.
 # CLI flags override values set here.
 
-# COM port for the Open DMX USB adapter (e.g., COM3)
+# Serial port for the Open DMX USB adapter.
+# COM3 on Windows, /dev/cu.usbserial-XXXX on macOS, /dev/ttyUSB0 on Linux.
+# Leave empty to auto-detect a single attached adapter.
 comPort=
 
 # Number of DMX channels to display (1-512)

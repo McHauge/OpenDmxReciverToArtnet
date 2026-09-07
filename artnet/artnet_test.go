@@ -119,12 +119,20 @@ func TestDecodeArtDmxRoundTrip(t *testing.T) {
 	if universe != 100 {
 		t.Errorf("expected universe 100, got %d", universe)
 	}
-	if frame.Length != 256 {
-		t.Errorf("expected length 256, got %d", frame.Length)
+	// EncodeArtDmx always emits a full 512-channel packet regardless of
+	// frame.Length, so a 256-channel frame decodes back as 512 with the
+	// unused tail zero-padded.
+	if frame.Length != dmx.MaxChannels {
+		t.Errorf("expected length %d, got %d", dmx.MaxChannels, frame.Length)
 	}
 	for i := 0; i < 256; i++ {
 		if frame.Channels[i] != byte(i%256) {
 			t.Errorf("channel %d: expected %d, got %d", i, byte(i%256), frame.Channels[i])
+		}
+	}
+	for i := 256; i < dmx.MaxChannels; i++ {
+		if frame.Channels[i] != 0 {
+			t.Errorf("channel %d: expected zero padding, got %d", i, frame.Channels[i])
 		}
 	}
 }
